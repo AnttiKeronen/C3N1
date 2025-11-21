@@ -1,3 +1,10 @@
-# Ignore huge data folders
-C3N/data/
-data/
+# Ignore generated crop images
+data/weibo/processed/crops/
+C3N/data/weibo/processed/crops/
+processed/crops/
+crops/
+
+data/twitter/processed/crops/
+C3N/data/twitter/processed/crops/
+processed/crops/
+crops/
