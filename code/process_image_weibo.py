@@ -1,139 +1,99 @@
-from PIL import Image
 import os
 import numpy as np
-import torchvision
-import torchvision.transforms as T
+from PIL import Image
 import torch
-import matplotlib
-matplotlib.use('Agg')
-import pandas as pd
-from cn_clip.clip import load_from_name, available_models
-import re
 from tqdm import tqdm
-import setproctitle
-setproctitle.setproctitle('qiaojiao')
+import pandas as pd
+from transformers import CLIPProcessor, CLIPModel
 
-data_dir = "/sda/qiaojiao/code/Weibo16/row"
-processed_dir = "/sda/qiaojiao/code/Weibo16/processed"
-big_processed_dir = "/sda/qiaojiao/code/Weibo16/processed"
-processed_img_dir = "/sda/qiaojiao/code/Weibo16/processed/crops"
+# -----------------------------
+# PATHS
+# -----------------------------
+data_dir = r"C:\Users\keron\OneDrive\Työpöytä\C3N\data\weibo\row"
+processed_dir = r"C:\Users\keron\OneDrive\Työpöytä\C3N\data\weibo\processed"
+device = "cpu"
 
-
-device = "cuda:1"
 CROP_NUM = 5
 
-def makedir(path):
-    """ 创建新文件夹, imwrite无法写入未创建的文件夹
-    """
-    dir_path = os.path.dirname(path)
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
+
+# -----------------------------
+# Simple 5-crop function
+# -----------------------------
+def make_5_crops(img: Image.Image):
+    w, h = img.size
+    half_w, half_h = w // 2, h // 2
+
+    return [
+        img,  # full
+        img.crop((0, 0, half_w, half_h)),          # top-left
+        img.crop((half_w, 0, w, half_h)),          # top-right
+        img.crop((0, half_h, half_w, h)),          # bottom-left
+        img.crop((half_w, half_h, w, h)),          # bottom-right
+    ]
 
 
-def clip_image_preprocess(df, preprocess):
-    """ preprocess crops for CLIP, df: note the label, padding to crop_num
-    """
-    image_dic = {}
-    error_origin_count = 0
-    error_crop_count = 0
-    for i, path in enumerate(os.listdir(processed_img_dir)):
-        print(i)
-        crop_list = []
-        # first is origin image
-        label = df.loc[df['image_id'] == path]['label']
-        if len(label) == 0:
-            print("can not find: ", path)
+# -----------------------------
+# MAIN
+# -----------------------------
+def main():
+
+    # load split files
+    df_train = np.load(os.path.join(processed_dir, "train_EANN_frozen.npy"), allow_pickle=True)
+    df_valid = np.load(os.path.join(processed_dir, "valid_EANN_frozen.npy"), allow_pickle=True)
+    df_test = np.load(os.path.join(processed_dir, "test_EANN_frozen.npy"), allow_pickle=True)
+
+    columns = ['original_post', 'label', 'image_id', 'post_id']
+    df_train = pd.DataFrame(df_train, columns=columns)
+    df_valid = pd.DataFrame(df_valid, columns=columns)
+    df_test = pd.DataFrame(df_test, columns=columns)
+
+    all_df = pd.concat([df_train, df_valid, df_test], ignore_index=True)
+
+    # -----------------------------
+    # Load HuggingFace CLIP
+    # -----------------------------
+    print("Loading CLIP...")
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
+
+    image_dict = {}
+
+    print("Processing images...")
+    for _, row in tqdm(all_df.iterrows(), total=len(all_df)):
+        image_id = row["image_id"]
+
+        img_path1 = os.path.join(data_dir, "nonrumor_images", image_id + ".jpg")
+        img_path2 = os.path.join(data_dir, "rumor_images", image_id + ".jpg")
+
+        img_path = img_path1 if os.path.exists(img_path1) else img_path2
+
+        if not os.path.exists(img_path):
             continue
-        if label.iloc[0] == 0:
-            imgdir = data_dir + '/nonrumor_images/'
-        else:
-            imgdir = data_dir + '/rumor_images/'
+
         try:
-            img = preprocess(Image.open(imgdir + path + ".jpg").convert('RGB')) 
-            crop_list.append(img)
-            file_list = os.listdir(os.path.join(processed_img_dir, path))
-            i = 0
-            for j, filename in enumerate(file_list):
-                if re.findall('_object', filename):
-                    continue
+            img = Image.open(img_path).convert("RGB")
+        except:
+            continue
 
-                try:
-                    image = preprocess(Image.open(os.path.join(processed_img_dir, path, filename)).convert('RGB'))
-                    crop_list.append(image)
-                    i += 1
-                except:
-                    print("error file: ", filename)
-                    error_crop_count += 1
-            while i < CROP_NUM:
-                image = torch.zeros(3, 224, 224)
-                crop_list.append(image)
-                i += 1
-            if i > CROP_NUM:
-                crop_list = crop_list[:CROP_NUM + 1]
+        crops = make_5_crops(img)
 
-            crop_inputs = torch.tensor(np.stack(crop_list))
-            image_dic[path] = crop_inputs
-            print("crop length ", str(len(crop_list) - 1))
-        except Exception as e:
-            print("error origin file: ", imgdir + path + ".jpg")
-            error_origin_count += 1
-            print(e)
+        crop_tensors = []
+        for crop in crops:
+            # Resize every crop to 224x224
+            crop = crop.resize((224, 224))
 
-    print("image length", str(len(image_dic)))
-    print("error origin image: ", error_origin_count)
-    print("error crop count: ", error_crop_count)
-    np.save(big_processed_dir + "/clip_image_preprocess.npy", image_dic)  # clip_image_preprocess
+            inputs = processor(images=crop, return_tensors="pt")
+            tensor = inputs["pixel_values"][0]  # (3,224,224)
 
-def cut_image(image, num):
-    """ cut image for patches
-    """
-    width, height = image.size
-    item_width = int(width / num)
-    box_list = []
-    # (left, upper, right, lower)
-    for i in range(0, num):
-        for j in range(0, num):
-            box = (j * item_width, i * item_width, (j + 1) * item_width, (i + 1) * item_width)
-            box_list.append(box)
-    image_list = [np.array(image.crop(box)) for box in box_list]
-    return image_list
+            crop_tensors.append(tensor)
+
+        crop_tensors = torch.stack(crop_tensors, dim=0)  # [5, 3, 224, 224]
+        image_dict[image_id] = crop_tensors.numpy()
+
+    save_path = os.path.join(processed_dir, "clip_image_preprocess.npy")
+    np.save(save_path, image_dict, allow_pickle=True)
+
+    print(f"Saved image crops → {save_path}")
 
 
-def image_patch_preprocess(df, preprocess, transform):
-    """ save image patch inputs
-    """
-    image_inputs_dic = {}
-    for index, row in tqdm(df.iterrows(), total=len(df)):
-        # print(index, '/', len(df))
-        image_id = row['image_id']
-        path = os.path.join("/sda/qiaojiao/code/Weibo16/processed/Weibo16_images_EANNSplit", image_id + '.jpg')
-        image = Image.open(path).convert('RGB')
-        ori_image = preprocess(image)
-        image = image.resize((640, 640), Image.ANTIALIAS)
-        image_list = cut_image(image, 4)  # crop_num
-        images = torch.tensor(image_list)  # [patch_num, h, w, 3]
-        images = images.permute(0, 3, 1, 2).float()
-        images = transform(images)
-        images = torch.cat([ori_image.unsqueeze(0), images], dim=0)
-        image_inputs_dic[image_id] = images
-    np.save(big_processed_dir + "/clip_patch_preprocess_16.npy", image_inputs_dic)
-
-
-if __name__ == '__main__':
-    
-    df_train = np.load(processed_dir + "/train_EANN_frozen.npy", allow_pickle=True)
-    df_valid = np.load(processed_dir + "/valid_EANN_frozen.npy", allow_pickle=True)
-    df_test = np.load(processed_dir + "/test_EANN_frozen.npy", allow_pickle=True)
-    df_columns = ['original_post', 'label', 'image_id', 'post_id']
-    df_train = pd.DataFrame(df_train, columns=df_columns)
-    df_valid = pd.DataFrame(df_valid, columns=df_columns)
-    df_test = pd.DataFrame(df_test, columns=df_columns)
-
-    all_data_df = pd.concat([df_train, df_valid, df_test], axis=0, ignore_index=True, sort=False)
-
-    model, preprocess = load_from_name("ViT-B-16", device=device, download_root='/sda/qiaojiao/pretrained_models/cn-clip/')
-    model.float()
-    for param in model.parameters():
-        param.requires_grad = False
-    model.eval()
-    clip_image_preprocess(all_data_df[['label', 'image_id']], preprocess)
+if __name__ == "__main__":
+    main()
